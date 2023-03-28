@@ -45,6 +45,7 @@ class IAController:
         # Flags
         self.testRunning = False
         self.isCalibrating = False
+        self.isQC_Running = False
         self.testInitialized = False
         self.FSM_State = 0
         self.currCount = 0
@@ -54,9 +55,9 @@ class IAController:
 
     # Connects to ADALM2000
     def connectDevice(self, ctx):
-        
-        #ctx.calibrateADC()
-        #ctx.calibrateDAC()
+        #recentPlug = False
+        #if ctx.getDacCalibrationGain(0) == 1.0:
+        #    recentPlug = True
         ctx.calibrateFromContext()
         self.getADALMCalibrationValues(ctx)
 
@@ -65,12 +66,17 @@ class IAController:
         aout = ctx.getAnalogOut()
         pwr = ctx.getPowerSupply()
         dig = ctx.getDigital()
+        
+        #if recentPlug:
+        for i in range(2):
+            dig.setDirection(i, 1)
+                #dig.enableChannel(i, True)
 
         ain.setSampleRate(100e6)
         ain.setOversamplingRatio(1)
         ain.setRange(0, -5,5); ain.setRange(1, -5,5)
         ain.enableChannel(0, True); ain.enableChannel(1, True)
-
+        
         pwr.enableChannel(0,True)
         pwr.pushChannel(0,5)
 
@@ -98,6 +104,7 @@ class IAController:
         N_channels = 4;
         activeTest = Test(self, testParams, N_channels)
         self.N_channels = activeTest.N_channels
+        self.currCount = 0;
 
         # Set Output parameters
         self.saveDataFilePath = saveDataFilePath
@@ -109,9 +116,6 @@ class IAController:
 
         # Enable Digital Output
         dig = self.dig;
-        for i in range(16):
-            dig.setDirection(i, 1)
-        dig.enableAllOut(True)
 
         # Create Test Signal
         Fs_out = 75e6  # Output Sample Rate
@@ -206,10 +210,7 @@ class IAController:
                 #print(f"Stored: {t_m-self.t_start}")
                 self.runTask = self.root.after(t_adj-4, lambda: self.runTest(t0))
             else:
-                if self.isCalibrating:
-                    self.stopTest("Calibration")
-                else:
-                    self.stopTest("Completed")
+                self.stopTest()
 
     def collectData(self, activeTest):
         dataOut = []
@@ -218,16 +219,20 @@ class IAController:
         ain = self.ain
         dig = self.dig
         # Loop through active channels and collect data for each
+        #print(channelList)
         for i in channelList:
 
             # Set MUX Output Values to Switch Active Channels
             for j in range(2):
+                #print(self.digLevels[i])
                 dig.setValueRaw(j, bool(self.digLevels[i][j]))
+                #print(f"Channel {j}: {dig.getValueRaw(j)}")
             
             # Acquire data from buffer
             ain.startAcquisition(self.SAMPLESPERMEASUREMENT);
             dataOut.append(ain.getSamples(self.SAMPLESPERMEASUREMENT));
             ain.stopAcquisition();
+            
         
         return dataOut
 
@@ -296,10 +301,13 @@ class IAController:
                                  activeTest.C[n-1], activeTest.phi[n-1], self.currTemp])
             output_file.close()
 
-    def stopTest(self, reason):
+    def stopTest(self, reason = None):
         self.FSM_State = 5
+        calib = self.isCalibrating
+        qc = self.isQC_Running
         self.testRunning = False
-        self.appController.stopTest()
+        #self.aout.enableChannel(0, False);
+        self.appController.stopTest(calib, qc)
         statusQueue = self.statusQueue
         
         if self.testInitialized:
@@ -309,20 +317,28 @@ class IAController:
             #self.pwr.enableChannel(0,False)
 
         # Log appropriate status to window
-        if reason == "Connection":
-            statusQueue.put("Sensor misaligned or not connected. Please check connection and retry")
-        elif reason == "Canceled":
-            statusQueue.put("Test canceled by user")
-        elif reason == "Completed":
-            statusQueue.put("Collection Complete")
-            self.calculateStats(True) # Change to true to get stats
-        elif reason == "Calibration":
-            statusQueue.put("Calibration Complete")
-            self.calculateStats(True)
-            self.isCalibrating = False
-            self.finishCalibration()
+        
+        # Default Message for bad connection
+        message = "Sensor misaligned or not connected. Please check connection and retry"
+        
+        if reason == "Canceled":
+            message = "Test canceled by user"
         else:
-            statusQueue.put("Error: Unknown Test Abort")
+            message = "Unknown Abort"
+            if calib:
+                message = "Calibration Complete"
+                self.calculateStats()
+                self.isCalibrating = False
+            elif qc:
+                message = "QC Complete"
+                self.calculateStats()
+                self.isQC_Running = False
+            else:
+                message = "Collection Complete"
+                self.calculateStats() # Change to true to get stats
+        
+        # Log Message
+        statusQueue.put(message)
     
     def getADALMCalibrationValues(self, ctx):
         print(ctx.getAdcCalibrationGain(0))
@@ -332,22 +348,32 @@ class IAController:
         print(ctx.getDacCalibrationGain(0))
         print(ctx.getDacCalibrationOffset(0))
 
-    def calculateStats(self, calibrating):
+    def calculateStats(self):
         x1 = self.activeTest; t = x1.t; N = x1.C.shape[1];
         # Calibration Stats
-        if calibrating:
+        calib = self.isCalibrating
+        qc = self.isQC_Running
+        
+        if calib or qc:
             for i in range(N):
                 CMean = round(np.mean(x1.C[:, i]), 3); Cstd = round(np.std(x1.C[:, i]), 3)
                 GMean = round(np.mean(x1.G[:, i]), 4); Gstd = round(np.std(x1.G[:, i]), 4)
                 ZMean = round(np.mean(x1.Z[:, i]), 4); Zstd = round(np.std(x1.Z[:, i]), 4)
                 PhiMean = round(np.mean(x1.phi[:, i]), 4); Phistd = round(np.std(x1.phi[:, i]), 4)
                 Z_compMean = np.mean(x1.Z_comp[:, i]); VratMean = np.mean(x1.Vrat[:, i]);
-                self.statusQueue.put(f" G = {GMean}+{Gstd}, C = {CMean}+{Cstd}, Z = {ZMean}+{Zstd}, Phi = {PhiMean}+{Phistd}")
                 #self.statusQueue.put('Z = {:.5f}'.format(Z_compMean))
-                self.statusQueue.put('Vrat = {:.5f}'.format(VratMean))
-                x1.CMean[i] = CMean; x1.GMean[i] = GMean;
-                x1.ZMean[i] = ZMean; x1.PhiMean[i] = PhiMean;
-                x1.Z_compMean[i] = Z_compMean; x1.VratMean[i] = VratMean;
+                x1.CMean[i] = CMean; x1.GMean[i] = GMean
+                x1.ZMean[i] = ZMean; x1.PhiMean[i] = PhiMean
+                x1.Z_compMean[i] = Z_compMean; x1.VratMean[i] = VratMean
+                
+                # Enable to print stats
+                if False:
+                    self.statusQueue.put('Vrat = {:.5f}'.format(VratMean))
+                    self.statusQueue.put(f" G = {GMean}+{Gstd}, C = {CMean}+{Cstd}, Z = {ZMean}+{Zstd}, Phi = {PhiMean}+{Phistd}")
+            if calib:
+                self.finishCalibration()
+            else:
+                self.finishQC()
         else:
             for i in range(N):
                 # Calculate Tpeak and Delta Epsilon Max
@@ -360,6 +386,7 @@ class IAController:
                 
     
     def runCalibration(self, calibStringZ):
+        self.isCalibrating = True
         self.Zc = complex(calibStringZ.get())
         runT = 30
         Fm = 0.2
@@ -372,21 +399,45 @@ class IAController:
         if self.ctx:
             self.pwr.enableChannel(0, False)
             libm2k.contextClose(self.ctx)
+    
+    def finishQC(self):
+        activeTest = self.activeTest
+        C_QC = np.asarray([48, 98, 220, 270])
+        G_QC = np.asarray([5.56, 2.57, 10.00, 5.57])
         
+        # Calculate Normalized Root Mean Squared Deviation across range
+        rmsdC = np.sqrt(np.mean((activeTest.CMean - C_QC)**2))/(C_QC[3]-C_QC[0])*100
+        rmsdG = np.sqrt(np.mean((activeTest.GMean - G_QC)**2))/(G_QC[2]-G_QC[1])*100
+        if rmsdC < 2 and rmsdG < 2:
+            self.statusQueue.put(f"QC Passed! \nC Error = {rmsdC}%, \nG Error = {rmsdG}%")
+        else:
+            self.statusQueue.put(f"QC Failed! \nC Error = {rmsdC}%, \nG Error = {rmsdG}%")
         
         
     def finishCalibration(self):
         activeTest = self.activeTest
-        j = 0
-
+        newVal = np.zeros((4, 1), dtype=complex)
+        oldVal = self.M_calib
+        dist = np.zeros((4, 1))
+        distThresh = 9
+        # Compute Values and Distances
         for i in self.channelList:
-            self.M_calib[i] = (self.Zc+self.R_OFFSET[i])/(activeTest.VratMean[i])
-            self.statusQueue.put('New Calibration Value: {:.4f}'.format(self.M_calib[i]))
-            j+=1
-            
-        # Write to file
-        with open(self.CALIBFILEPATH, 'w', newline = '') as output_file:
-             csv_writer = csv.writer(output_file, delimiter = ',')
-             csv_writer.writerow(self.M_calib)         
-        self.statusQueue.put("Parameters succesfully saved to file");
+            newVal[i] = (self.Zc+self.R_OFFSET[i])/(activeTest.VratMean[i])
+            dist[i] = (np.real(newVal[i]) - np.real(oldVal[i]))**2 + (np.imag(newVal[i]) - np.imag(oldVal[i]))**2
+        #print(newVal)
+        #print(oldVal)
+        #print(dist)
+        if (dist > distThresh).any():
+            self.statusQueue.put('Calibration Failure. Check connection and try again')
+        else:
+            self.statusQueue.put('Calibration Sucessful!')
+            for i in self.channelList:
+                self.M_calib[i] = newVal[i]
+                self.statusQueue.put('New Calibration Values: {:.4f}'.format(self.M_calib[i]))
         
+            # Write to file
+            with open(self.CALIBFILEPATH, 'w', newline = '') as output_file:
+                csv_writer = csv.writer(output_file, delimiter = ',')
+                csv_writer.writerow(self.M_calib)         
+            self.statusQueue.put("Parameters succesfully saved to file");
+            

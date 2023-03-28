@@ -3,6 +3,7 @@ import libm2k
 class I2CController:
     
     TOGGLEHEAT = bytearray([0x01]);
+    TEST = bytearray([0x00]);
     
     def __init__(self, appController):
         self.appController = appController;
@@ -33,6 +34,7 @@ class I2CController:
             
     def toggleHeat(self):
         return self.i2c_write(self.TOGGLEHEAT);
+        #return self.i2c_write(self.TEST);
     
     def readTemp(self, nBytes):
         return self.i2c_read(nBytes)
